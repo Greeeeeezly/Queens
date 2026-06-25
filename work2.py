@@ -10,11 +10,18 @@
    - ферзи не бьют друг друга (классические правила N-ферзей),
    - все ферзи стоят на клетках одного и того же цвета.
 5) Для каждого решения считается сумма стоимостей и доступна сортировка.
+
+Агентная логика:
+- каждый ферзь является отдельным потоком QueenAgent;
+- у каждого агента есть собственная очередь входящих сообщений;
+- агент самостоятельно фильтрует свои локальные состояния;
+- итоговое решение получается через передачу сообщений между агентами.
 """
 
 from __future__ import annotations
 
 import json
+import queue
 import random
 import sqlite3
 import threading
@@ -69,19 +76,95 @@ class SolutionRecord:
     common_color: str
 
 
-class QueenAgent:
-    def __init__(self, column: int) -> None:
+class QueenAgent(threading.Thread):
+    """Независимый агент-ферзь с локальными состояниями из базы знаний."""
+
+    def __init__(
+        self,
+        column: int,
+        local_states: Dict[int, CellState],
+        inbox: "queue.Queue[dict]",
+        next_inbox: Optional["queue.Queue[dict]"],
+        solutions: List["SolutionRecord"],
+        solution_lock: threading.Lock,
+        stop_flag: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
         self.column = column
-        self.row: Optional[int] = None
-        self.state: Optional[CellState] = None
+        self.local_states = local_states
+        self.inbox = inbox
+        self.next_inbox = next_inbox
+        self.solutions = solutions
+        self.solution_lock = solution_lock
+        self.stop_flag = stop_flag
 
-    def set_state(self, row: int, state: CellState) -> None:
-        self.row = row
-        self.state = state
+    def run(self) -> None:
+        while not self.stop_flag.is_set():
+            try:
+                message = self.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-    def reset(self) -> None:
-        self.row = None
-        self.state = None
+            kind = message.get("kind")
+            if kind == "STOP":
+                return
+            if kind == "DONE":
+                if self.next_inbox is not None:
+                    self.next_inbox.put({"kind": "DONE"})
+                return
+            if kind != "TRY":
+                continue
+
+            self._process_try(message)
+
+    def _process_try(self, message: dict) -> None:
+        positions: List[int] = list(message["positions"])
+        used_rows: set[int] = set(message["used_rows"])
+        used_diag1: set[int] = set(message["used_diag1"])
+        used_diag2: set[int] = set(message["used_diag2"])
+        common_color: Optional[str] = message["common_color"]
+        acc_cost = float(message["acc_cost"])
+
+        for row, state in self.local_states.items():
+            if self.stop_flag.is_set():
+                return
+
+            d1 = row - self.column
+            d2 = row + self.column
+            if row in used_rows or d1 in used_diag1 or d2 in used_diag2:
+                continue
+            if common_color is not None and state.color != common_color:
+                continue
+
+            new_positions = positions + [row]
+            new_color = state.color if common_color is None else common_color
+            new_cost = acc_cost + state.cost
+
+            if self.next_inbox is None:
+                with self.solution_lock:
+                    if len(self.solutions) < MAX_SOLUTIONS:
+                        self.solutions.append(
+                            SolutionRecord(
+                                positions=new_positions,
+                                total_cost=round(new_cost, 2),
+                                common_color=new_color,
+                            )
+                        )
+                    if len(self.solutions) >= MAX_SOLUTIONS:
+                        self.stop_flag.set()
+                continue
+
+            self.next_inbox.put(
+                {
+                    "kind": "TRY",
+                    "positions": new_positions,
+                    "used_rows": used_rows | {row},
+                    "used_diag1": used_diag1 | {d1},
+                    "used_diag2": used_diag2 | {d2},
+                    "common_color": new_color,
+                    "acc_cost": new_cost,
+                }
+            )
 
 
 class KnowledgeBase:
@@ -275,84 +358,67 @@ class KnowledgeBase:
 
 
 class NQueensSolverStage2:
+    """
+    Инфраструктурный запуск агентной цепочки.
+
+    Класс не выполняет централизованный перебор состояний, а создает очереди,
+    запускает независимых агентов и отправляет первое сообщение.
+    """
+
     def __init__(self, n: int, state_map: Dict[Tuple[int, int], CellState]) -> None:
         self.n = n
         self.state_map = state_map
-        self.agents: List[QueenAgent] = [QueenAgent(i) for i in range(n)]
+        self._queues: List["queue.Queue[dict]"] = [queue.Queue() for _ in range(n)]
+        self._solution_lock = threading.Lock()
         self.solutions: List[SolutionRecord] = []
         self._stop = threading.Event()
+        self.agents: List[QueenAgent] = []
+        for column in range(n):
+            local_states = {row: state_map[(column, row)] for row in range(n)}
+            self.agents.append(
+                QueenAgent(
+                    column=column,
+                    local_states=local_states,
+                    inbox=self._queues[column],
+                    next_inbox=self._queues[column + 1] if column + 1 < n else None,
+                    solutions=self.solutions,
+                    solution_lock=self._solution_lock,
+                    stop_flag=self._stop,
+                )
+            )
 
     def stop(self) -> None:
         self._stop.set()
+        for inbox in self._queues:
+            inbox.put({"kind": "STOP"})
 
     def solve(self) -> None:
         self.solutions.clear()
         self._stop.clear()
-        self._backtrack(
-            col=0,
-            used_rows=set(),
-            used_diag1=set(),
-            used_diag2=set(),
-            common_color=None,
-            acc_cost=0.0,
+        for agent in self.agents:
+            agent.start()
+
+        self._queues[0].put(
+            {
+                "kind": "TRY",
+                "positions": [],
+                "used_rows": set(),
+                "used_diag1": set(),
+                "used_diag2": set(),
+                "common_color": None,
+                "acc_cost": 0.0,
+            }
         )
+        self._queues[0].put({"kind": "DONE"})
 
-    def _backtrack(
-        self,
-        col: int,
-        used_rows: set[int],
-        used_diag1: set[int],
-        used_diag2: set[int],
-        common_color: Optional[str],
-        acc_cost: float,
-    ) -> None:
-        if self._stop.is_set():
-            return
-        if len(self.solutions) >= MAX_SOLUTIONS:
-            self._stop.set()
-            return
-
-        if col == self.n:
-            self.solutions.append(
-                SolutionRecord(
-                    positions=[a.row for a in self.agents if a.row is not None],
-                    total_cost=round(acc_cost, 2),
-                    common_color=common_color or "red",
-                )
-            )
-            return
-
-        for row in range(self.n):
-            if self._stop.is_set():
-                return
-
-            d1 = row - col
-            d2 = row + col
-            if row in used_rows or d1 in used_diag1 or d2 in used_diag2:
-                continue
-
-            state = self.state_map[(col, row)]
-            if common_color is not None and state.color != common_color:
-                continue
-
-            self.agents[col].set_state(row, state)
-            used_rows.add(row)
-            used_diag1.add(d1)
-            used_diag2.add(d2)
-
-            self._backtrack(
-                col=col + 1,
-                used_rows=used_rows,
-                used_diag1=used_diag1,
-                used_diag2=used_diag2,
-                common_color=state.color if common_color is None else common_color,
-                acc_cost=acc_cost + state.cost,
-            )
-
-            used_rows.remove(row)
-            used_diag1.remove(d1)
-            used_diag2.remove(d2)
-            self.agents[col].reset()
+        stop_sent = False
+        while any(agent.is_alive() for agent in self.agents):
+            if self._stop.is_set() and not stop_sent:
+                for inbox in self._queues:
+                    inbox.put({"kind": "STOP"})
+                stop_sent = True
+            for agent in self.agents:
+                agent.join(timeout=0.05)
 
 
 class QueensApp(tk.Tk):

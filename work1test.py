@@ -7,7 +7,8 @@
 
 Функциональность:
   - Каждый ферзь — экземпляр отдельного класса QueenAgent
-  - Поиск с возвратом (backtracking) всех допустимых расстановок
+  - Каждый агент работает в собственном потоке и имеет очередь сообщений
+  - Поиск всех допустимых расстановок выполняется через обмен сообщениями
   - Поиск выполняется в фоновом потоке — интерфейс не зависает
   - Кнопка «⏹ Стоп» для прерывания поиска
   - Лимит MAX_SOLUTIONS решений (защита от зависания)
@@ -20,6 +21,7 @@
 
 import tkinter as tk
 from tkinter import ttk
+import queue
 import threading
 from typing import List, Optional
 
@@ -39,88 +41,148 @@ DARK  = '#B58863'
 
 # ══════════════════════════ Агент-ферзь ════════════════════════════════════
 
-class QueenAgent:
+class QueenAgent(threading.Thread):
     """
-    Агент-ферзь. Каждый экземпляр соответствует одному столбцу доски.
-    Отвечает за хранение своей позиции и проверку позиционных конфликтов.
+    Независимый агент-ферзь. Каждый экземпляр соответствует одному столбцу
+    доски, имеет собственную очередь сообщений и самостоятельно расширяет
+    полученную частичную конфигурацию допустимыми локальными состояниями.
     """
 
-    def __init__(self, column: int, n: int) -> None:
+    def __init__(
+        self,
+        column: int,
+        n: int,
+        inbox: "queue.Queue[dict]",
+        next_inbox: Optional["queue.Queue[dict]"],
+        solutions: List[List[int]],
+        solution_lock: threading.Lock,
+        stop_flag: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
         self.column: int = column
         self.n: int = n
-        self.row: Optional[int] = None
-
-    def set_row(self, row: int) -> None:
-        """Установить строку (позицию) агента."""
-        self.row = row
-
-    def reset(self) -> None:
-        """Сбросить позицию (при откате backtracking)."""
-        self.row = None
-
-    def conflicts_with(self, other: 'QueenAgent') -> bool:
-        """
-        Возвращает True, если этот ферзь атакует другого.
-        Предполагается, что other.column < self.column.
-        """
-        if self.row is None or other.row is None:
-            return False
-        if self.row == other.row:
-            return True
-        if abs(self.column - other.column) == abs(self.row - other.row):
-            return True
-        return False
+        self.inbox = inbox
+        self.next_inbox = next_inbox
+        self.solutions = solutions
+        self.solution_lock = solution_lock
+        self.stop_flag = stop_flag
 
     def __repr__(self) -> str:
-        return f"QueenAgent(col={self.column}, row={self.row})"
+        return f"QueenAgent(col={self.column})"
+
+    def run(self) -> None:
+        while not self.stop_flag.is_set():
+            try:
+                message = self.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            kind = message.get("kind")
+            if kind == "STOP":
+                return
+            if kind == "DONE":
+                if self.next_inbox is not None:
+                    self.next_inbox.put({"kind": "DONE"})
+                return
+            if kind != "TRY":
+                continue
+
+            self._process_try(message)
+
+    def _process_try(self, message: dict) -> None:
+        positions: List[int] = list(message["positions"])
+        used_rows: set[int] = set(message["used_rows"])
+        used_diag1: set[int] = set(message["used_diag1"])
+        used_diag2: set[int] = set(message["used_diag2"])
+
+        for row in range(self.n):
+            if self.stop_flag.is_set():
+                return
+
+            d1 = row - self.column
+            d2 = row + self.column
+            if row in used_rows or d1 in used_diag1 or d2 in used_diag2:
+                continue
+
+            new_positions = positions + [row]
+            if self.next_inbox is None:
+                with self.solution_lock:
+                    if len(self.solutions) < MAX_SOLUTIONS:
+                        self.solutions.append(new_positions)
+                    if len(self.solutions) >= MAX_SOLUTIONS:
+                        self.stop_flag.set()
+                continue
+
+            self.next_inbox.put(
+                {
+                    "kind": "TRY",
+                    "positions": new_positions,
+                    "used_rows": used_rows | {row},
+                    "used_diag1": used_diag1 | {d1},
+                    "used_diag2": used_diag2 | {d2},
+                }
+            )
 
 
 # ══════════════════════════ Решатель ═══════════════════════════════════════
 
 class NQueensSolver:
     """
-    Поиск с возвратом (backtracking) всех расстановок N ферзей.
-    Каждый ферзь — экземпляр QueenAgent.
-    Останавливается при достижении MAX_SOLUTIONS или вызове stop().
+    Распределенный поиск всех расстановок N ферзей.
+    Каждый ферзь — независимый агент со своей очередью сообщений.
+    Этот класс не выбирает позиции за агентов, а только запускает цепочку
+    сообщений и ожидает завершения работы.
     """
 
     def __init__(self, n: int) -> None:
         self.n = n
-        self.agents: List[QueenAgent] = [QueenAgent(i, n) for i in range(n)]
+        self._queues: List["queue.Queue[dict]"] = [queue.Queue() for _ in range(n)]
+        self._solution_lock = threading.Lock()
         self.solutions: List[List[int]] = []
         self._stop_flag = threading.Event()
+        self.agents: List[QueenAgent] = [
+            QueenAgent(
+                column=i,
+                n=n,
+                inbox=self._queues[i],
+                next_inbox=self._queues[i + 1] if i + 1 < n else None,
+                solutions=self.solutions,
+                solution_lock=self._solution_lock,
+                stop_flag=self._stop_flag,
+            )
+            for i in range(n)
+        ]
 
     def stop(self) -> None:
         self._stop_flag.set()
+        for inbox in self._queues:
+            inbox.put({"kind": "STOP"})
 
     def solve(self) -> None:
         self.solutions.clear()
         self._stop_flag.clear()
-        self._backtrack(0)
+        for agent in self.agents:
+            agent.start()
 
-    def _backtrack(self, col: int) -> None:
-        if self._stop_flag.is_set():
-            return
-        if col == self.n:
-            self.solutions.append([a.row for a in self.agents])
-            if len(self.solutions) >= MAX_SOLUTIONS:
-                self._stop_flag.set()
-            return
+        self._queues[0].put(
+            {
+                "kind": "TRY",
+                "positions": [],
+                "used_rows": set(),
+                "used_diag1": set(),
+                "used_diag2": set(),
+            }
+        )
+        self._queues[0].put({"kind": "DONE"})
 
-        for row in range(self.n):
-            if self._stop_flag.is_set():
-                return
-            # Проверяем конфликт с уже размещёнными агентами (0..col-1)
-            conflict = False
-            for i in range(col):
-                if self.agents[i].row == row:
-                    conflict = True; break
-                if abs(i - col) == abs(self.agents[i].row - row):
-                    conflict = True; break
-            if not conflict:
-                self.agents[col].set_row(row)
-                self._backtrack(col + 1)
-                self.agents[col].reset()
+        stop_sent = False
+        while any(agent.is_alive() for agent in self.agents):
+            if self._stop_flag.is_set() and not stop_sent:
+                for inbox in self._queues:
+                    inbox.put({"kind": "STOP"})
+                stop_sent = True
+            for agent in self.agents:
+                agent.join(timeout=0.05)
 
 
 # ══════════════════════════ Главное окно ═══════════════════════════════════

@@ -7,12 +7,19 @@
 2) Фиксированные ферзи получают высший приоритет в цепочке взаимодействия.
 3) Можно вручную задавать приоритет каждого агента.
 4) Визуальное положение фигур на доске не меняется.
+
+Агентная логика:
+- каждый ферзь является отдельным потоком QueenAgent;
+- порядок взаимодействия задается цепочкой сообщений;
+- фиксированные агенты получают приоритет в цепочке;
+- центральный класс не назначает состояния за агентов.
 """
 
 from __future__ import annotations
 
 import json
 import ast
+import queue
 import random
 import sqlite3
 import threading
@@ -76,20 +83,33 @@ class SolutionRecord:
     interaction_order: List[int]
 
 
-class QueenAgent:
-    def __init__(self, column: int, local_states: Dict[int, CellState]) -> None:
+class QueenAgent(threading.Thread):
+    """Независимый агент-ферзь с локальными состояниями и настройками управления."""
+
+    def __init__(
+        self,
+        column: int,
+        local_states: Dict[int, CellState],
+        control: AgentControl,
+        inbox: "queue.Queue[dict]",
+        next_inbox: Optional["queue.Queue[dict]"],
+        solutions: List["SolutionRecord"],
+        solution_lock: threading.Lock,
+        stop_flag: threading.Event,
+        n: int,
+        interaction_order: List[int],
+    ) -> None:
+        super().__init__(daemon=True)
         self.column = column
         self.local_states = local_states
-        self.row: Optional[int] = None
-        self.state: Optional[CellState] = None
-
-    def set_state(self, row: int, state: CellState) -> None:
-        self.row = row
-        self.state = state
-
-    def reset(self) -> None:
-        self.row = None
-        self.state = None
+        self.control = control
+        self.inbox = inbox
+        self.next_inbox = next_inbox
+        self.solutions = solutions
+        self.solution_lock = solution_lock
+        self.stop_flag = stop_flag
+        self.n = n
+        self.interaction_order = interaction_order
 
     def get_state(self, row: int) -> CellState:
         return self.local_states[row]
@@ -114,6 +134,81 @@ class QueenAgent:
                 continue
             out.append(row)
         return out
+
+    def run(self) -> None:
+        while not self.stop_flag.is_set():
+            try:
+                message = self.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            kind = message.get("kind")
+            if kind == "STOP":
+                return
+            if kind == "DONE":
+                if self.next_inbox is not None:
+                    self.next_inbox.put({"kind": "DONE"})
+                return
+            if kind != "TRY":
+                continue
+
+            self._process_try(message)
+
+    def _process_try(self, message: dict) -> None:
+        positions: Dict[int, int] = dict(message["positions"])
+        used_rows: set[int] = set(message["used_rows"])
+        used_diag1: set[int] = set(message["used_diag1"])
+        used_diag2: set[int] = set(message["used_diag2"])
+        common_color: Optional[str] = message["common_color"]
+        acc_cost = float(message["acc_cost"])
+
+        rows = self.candidate_rows(
+            fixed_row=self.control.fixed_row,
+            required_color=self.control.required_color,
+            common_color=common_color,
+        )
+
+        for row in rows:
+            if self.stop_flag.is_set():
+                return
+
+            d1 = row - self.column
+            d2 = row + self.column
+            if row in used_rows or d1 in used_diag1 or d2 in used_diag2:
+                continue
+
+            state = self.get_state(row)
+            new_positions = dict(positions)
+            new_positions[self.column] = row
+            new_color = state.color if common_color is None else common_color
+            new_cost = acc_cost + state.cost
+
+            if self.next_inbox is None:
+                with self.solution_lock:
+                    if len(self.solutions) < MAX_SOLUTIONS and len(new_positions) == self.n:
+                        self.solutions.append(
+                            SolutionRecord(
+                                positions=[new_positions[i] for i in range(self.n)],
+                                total_cost=round(new_cost, 2),
+                                common_color=new_color,
+                                interaction_order=self.interaction_order[:],
+                            )
+                        )
+                    if len(self.solutions) >= MAX_SOLUTIONS:
+                        self.stop_flag.set()
+                continue
+
+            self.next_inbox.put(
+                {
+                    "kind": "TRY",
+                    "positions": new_positions,
+                    "used_rows": used_rows | {row},
+                    "used_diag1": used_diag1 | {d1},
+                    "used_diag2": used_diag2 | {d2},
+                    "common_color": new_color,
+                    "acc_cost": new_cost,
+                }
+            )
 
 
 class KnowledgeBase:
@@ -365,6 +460,13 @@ class KnowledgeBase:
 
 
 class NQueensSolverStage3:
+    """
+    Инфраструктурный запуск агентной цепочки с учетом приоритетов.
+
+    Класс формирует порядок сообщений между агентами, но не выполняет
+    централизованный выбор состояний.
+    """
+
     def __init__(
         self,
         n: int,
@@ -374,14 +476,33 @@ class NQueensSolverStage3:
         self.n = n
         self.controls = {c.agent_id: c for c in controls}
         self.interaction_order = self._build_interaction_order(controls)
+        self._queues: List["queue.Queue[dict]"] = [queue.Queue() for _ in range(n)]
+        self._queue_by_agent = {
+            agent_id: self._queues[order_idx]
+            for order_idx, agent_id in enumerate(self.interaction_order)
+        }
+        self._solution_lock = threading.Lock()
+        self.solutions: List[SolutionRecord] = []
+        self._stop = threading.Event()
         self.agents: List[QueenAgent] = []
-        for agent_id in range(n):
+        for order_idx, agent_id in enumerate(self.interaction_order):
             local_states: Dict[int, CellState] = {}
             for row in range(n):
                 local_states[row] = state_map[(agent_id, row)]
-            self.agents.append(QueenAgent(agent_id, local_states))
-        self.solutions: List[SolutionRecord] = []
-        self._stop = threading.Event()
+            self.agents.append(
+                QueenAgent(
+                    column=agent_id,
+                    local_states=local_states,
+                    control=self.controls[agent_id],
+                    inbox=self._queues[order_idx],
+                    next_inbox=self._queues[order_idx + 1] if order_idx + 1 < n else None,
+                    solutions=self.solutions,
+                    solution_lock=self._solution_lock,
+                    stop_flag=self._stop,
+                    n=n,
+                    interaction_order=self.interaction_order,
+                )
+            )
 
     @staticmethod
     def _build_interaction_order(controls: List[AgentControl]) -> List[int]:
@@ -393,83 +514,36 @@ class NQueensSolverStage3:
 
     def stop(self) -> None:
         self._stop.set()
+        for inbox in self._queues:
+            inbox.put({"kind": "STOP"})
 
     def solve(self) -> None:
         self.solutions.clear()
         self._stop.clear()
-        self._backtrack(
-            order_idx=0,
-            used_rows=set(),
-            used_diag1=set(),
-            used_diag2=set(),
-            common_color=None,
-            acc_cost=0.0,
+        for agent in self.agents:
+            agent.start()
+
+        self._queues[0].put(
+            {
+                "kind": "TRY",
+                "positions": {},
+                "used_rows": set(),
+                "used_diag1": set(),
+                "used_diag2": set(),
+                "common_color": None,
+                "acc_cost": 0.0,
+            }
         )
+        self._queues[0].put({"kind": "DONE"})
 
-    def _backtrack(
-        self,
-        order_idx: int,
-        used_rows: set[int],
-        used_diag1: set[int],
-        used_diag2: set[int],
-        common_color: Optional[str],
-        acc_cost: float,
-    ) -> None:
-        if self._stop.is_set():
-            return
-        if len(self.solutions) >= MAX_SOLUTIONS:
-            self._stop.set()
-            return
-
-        if order_idx == self.n:
-            self.solutions.append(
-                SolutionRecord(
-                    positions=[a.row for a in self.agents if a.row is not None],
-                    total_cost=round(acc_cost, 2),
-                    common_color=common_color or "red",
-                    interaction_order=self.interaction_order[:],
-                )
-            )
-            return
-
-        agent_id = self.interaction_order[order_idx]
-        control = self.controls[agent_id]
-        agent = self.agents[agent_id]
-        rows = agent.candidate_rows(
-            fixed_row=control.fixed_row,
-            required_color=control.required_color,
-            common_color=common_color,
-        )
-
-        for row in rows:
-            if self._stop.is_set():
-                return
-
-            d1 = row - agent_id
-            d2 = row + agent_id
-            if row in used_rows or d1 in used_diag1 or d2 in used_diag2:
-                continue
-
-            state = agent.get_state(row)
-
-            self.agents[agent_id].set_state(row, state)
-            used_rows.add(row)
-            used_diag1.add(d1)
-            used_diag2.add(d2)
-
-            self._backtrack(
-                order_idx=order_idx + 1,
-                used_rows=used_rows,
-                used_diag1=used_diag1,
-                used_diag2=used_diag2,
-                common_color=state.color if common_color is None else common_color,
-                acc_cost=acc_cost + state.cost,
-            )
-
-            used_rows.remove(row)
-            used_diag1.remove(d1)
-            used_diag2.remove(d2)
-            self.agents[agent_id].reset()
+        stop_sent = False
+        while any(agent.is_alive() for agent in self.agents):
+            if self._stop.is_set() and not stop_sent:
+                for inbox in self._queues:
+                    inbox.put({"kind": "STOP"})
+                stop_sent = True
+            for agent in self.agents:
+                agent.join(timeout=0.05)
 
 
 class QueensApp(tk.Tk):
